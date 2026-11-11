@@ -1,0 +1,146 @@
+# A starter robot for rules v2: sweep a medium scan to find a robot, narrow
+# it to hold the robot, pick shot power by range, and fire only when the
+# turret is on target and the battery can spare it. With nothing in the
+# scan, follow a passive cue; step out of the storm. Glyph is postfix:
+# values first, then words.
+#
+# The trade-offs:
+#   scan     a narrow arc reaches further; a wide one finds robots nearby
+#   power    heavy shots hit harder for less battery, but fly slowly
+#   battery  shots and driving share it, and it refills slowly
+#   turret   it turns at a limited rate; aim is where it points now
+# Words read the same values as Vane and Cadence: ruleset physics-mode
+#   zero-g control-model inertial mode3 tick time remaining width height
+#   depth gravity-x gravity-y gravity-z terrain-kind hills health x y z vx
+#   vy vz heading pitch yaw-rate pitch-rate roll-rate forward-x forward-y
+#   forward-z right-x right-y right-z up-x up-y up-z grounded altitude
+#   battery battery-capacity aim aim-pitch cooldown scan-heading
+#   scan-pitch scan-arc scan-range contact range bearing elevation
+#   cue-present cue-error bearing-rate zone-active zone-radius
+#   storm-active storm-radius hill-active hill-radius score score-best
+#   speed gravity terrain-height battery-fraction aim-error power-min
+#   power-max shot-speed-base shot-speed-per-power shot-cost-base
+#   shot-cost-per-power zone-distance zone-bearing zone-elevation
+#   storm-distance storm-bearing storm-heading cue-muzzle cue-bearing
+#   cue-elevation cue-range cue-age pickup-present pickup-bearing
+#   pickup-elevation pickup-range on-hill hill-held hill-bearing
+#   hill-elevation hill-range hill-time hill-to-win
+# Older names: energy (battery) max-energy (battery-capacity)
+#   energy-fraction (battery-fraction) fire-base (shot-cost-base)
+#   fire-per-power (shot-cost-per-power)
+# cue-* is the most accurate passive contact, kept 60 ticks: where to
+# look, not where to shoot. A distance to something absent reads 1e12.
+# Controls end in "!": drive! turn! pitch-turn! thrust! strafe! lift!
+#   yaw-torque! pitch-torque! roll-torque! brake! aim! aim-pitch! fire!
+#   power! scan-heading! scan-arc! scan-pitch! status-text!
+#   status-value! (not in the -wasm builds)
+# Manual: https://clunkyard.com/manual#dsl
+bot My robot
+modes 2d 3d
+rulesets classic inertial-2d gravity-flat gravity-hills zero-g
+memory shot 1
+memory lob 0
+
+# 1 under a quarter battery, else 0.
+: low-battery  battery-fraction 0.25 < ;
+
+: track
+  # Circle the target instead of driving straight at it: a robot crossing
+  # the line of fire is harder to hit. The sine swings the heading 30
+  # degrees in and out every 50 ticks, so the range keeps changing too.
+  bearing 90 + tick 7.2 * sin 30 * + heading angle 45 / clamp1 turn!
+  pitch neg 45 / clamp1 pitch-turn!
+  # Driving costs battery, so go gently, and at half speed when it is low.
+  0.5 low-battery 0.25 * - drive!
+  bearing aim!
+  # Under gravity a shot drops on the way; it takes about a second, so aim
+  # higher by about half the gravity over the range (in degrees).
+  elevation gravity-z 28.6 * range shot-speed-base shot-speed-per-power power-max * + max / -
+  dup lob! aim-pitch!
+  bearing scan-heading!
+  elevation scan-pitch!
+  # Narrow: holds the contact and reaches about 735.
+  20 scan-arc!
+  # The heaviest shot that still reaches the target in about one second:
+  # shot speed is shot-speed-base + shot-speed-per-power * power.
+  range shot-speed-base - shot-speed-per-power / power-min power-max clamp
+  dup shot! power!
+  # Fire once the turret has slewed onto the target, keeping 10 in the
+  # battery after paying for the shot.
+  cooldown 0 =
+  aim-error abs 3 < and
+  lob@ aim-pitch - abs 3 < and
+  battery shot-cost-base shot-cost-per-power shot@ * + 10 + >= and
+  fire!
+;
+
+: search
+  0.6 low-battery 0.3 * - drive!
+  0.25 turn!
+  pitch neg 45 / clamp1 pitch-turn!
+  # Medium: sweeps the circle in half a second, reaching about 520.
+  scan-heading 36 + scan-heading!
+  # Nod the scanner up and down to find 3D targets above or below.
+  tick 12 * sin 25 * scan-pitch!
+  40 scan-arc!
+;
+
+# A passive cue says roughly where a robot is, within cue-error degrees:
+# head that way and sweep a narrow scan across it. It reaches further than
+# the medium scan, and the cue is no firing solution.
+: listen
+  cue-bearing heading angle 45 / clamp1 turn!
+  cue-bearing tick 25.7 * sin cue-error 10 + * + scan-heading!
+  cue-elevation scan-pitch!
+  30 scan-arc!
+;
+
+# Force rulesets (everything but classic) push the hull instead of steering
+# it: hover about 60 above the ground, keep the hull level, damp spin and
+# slow down near a target, without strafing: aim spread grows with the
+# robot's own speed. These writes replace the classic ones above.
+: fly
+  gravity-z neg 100 / gravity if 60 altitude - 100 / + then vz 50 / - clamp1 lift!
+  pitch neg 40 / pitch-rate 60 / - clamp1 pitch-torque!
+  roll-rate neg 60 / clamp1 roll-torque!
+  speed 70 > brake!
+  contact if
+    bearing heading angle 70 / yaw-rate 60 / - clamp1 yaw-torque!
+    range 200 - 180 / 0.5 neg 0.6 clamp 1 low-battery 0.5 * - * thrust!
+  else
+    # Turn toward a cue, or keep turning to search.
+    cue-present if cue-bearing heading angle 70 / else 0.2 then yaw-rate 60 / - clamp1 yaw-torque!
+    0.6 1 low-battery 0.5 * - * thrust!
+  then
+;
+
+# Sudden death: head back inside the safe zone. This replaces the steering
+# above but leaves the turret tracking and firing.
+: home
+  zone-bearing heading angle 30 / clamp1 turn!
+  zone-elevation pitch - 30 / clamp1 pitch-turn!
+  0.8 drive!
+  zone-bearing heading angle 70 / yaw-rate 60 / - clamp1 yaw-torque!
+  0.6 thrust!
+  gravity-z neg 100 / gravity if 60 altitude - 100 / + then
+  zone-elevation sin + vz 50 / - clamp1 lift!
+;
+
+# The storm drifts across the arena and hurts anything inside it: step out
+# across its path, at right angles to its drift, on the side this robot is
+# already on, so the storm passes by. When its centre lies to the left of
+# its drift (the angle is over 0), this robot is on the right of its path,
+# so the way out is storm-heading - 90; otherwise it is + 90. This replaces
+# the steering above but leaves the turret tracking and firing.
+: flee
+  storm-heading 90 + storm-bearing storm-heading angle 0 > 180 * -
+  dup heading angle 30 / clamp1 turn!
+  heading angle 70 / yaw-rate 60 / - clamp1 yaw-torque!
+  1 drive!
+  0.8 thrust!
+;
+
+contact if track else search cue-present if listen then then
+physics-mode if fly then
+storm-distance 60 < if flee then
+zone-active if zone-distance zone-radius 60 - > if home then then
